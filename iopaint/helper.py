@@ -360,6 +360,58 @@ def concat_alpha_channel(rgb_np_img, alpha_channel) -> np.ndarray:
     return rgb_np_img
 
 
+def alpha_channel_requires_inpaint(alpha_channel: Optional[np.ndarray]) -> bool:
+    if alpha_channel is None:
+        return False
+    return not np.all(alpha_channel == 255)
+
+
+def alpha_channel_to_rgb(alpha_channel: np.ndarray) -> np.ndarray:
+    return np.repeat(alpha_channel[:, :, np.newaxis], 3, axis=2)
+
+
+def rgb_to_alpha_channel(rgb_np_img: np.ndarray) -> np.ndarray:
+    if rgb_np_img.ndim != 3 or rgb_np_img.shape[2] != 3:
+        raise ValueError("rgb_np_img must be an RGB image with shape [H, W, 3]")
+    alpha_channel = cv2.cvtColor(rgb_np_img.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    return np.clip(alpha_channel, 0, 255).astype(np.uint8)
+
+
+def alpha_channel_is_binary_like(
+    alpha_channel: Optional[np.ndarray], tolerance: int = 8
+) -> bool:
+    if alpha_channel is None:
+        return False
+    # Treat near-0/near-255 alpha as binary-like so watermark/logo style assets
+    # can use deterministic OpenCV inpaint instead of a second generative pass.
+    return np.all((alpha_channel <= tolerance) | (alpha_channel >= 255 - tolerance))
+
+
+def postprocess_alpha_channel(
+    alpha_channel: np.ndarray,
+    mask: np.ndarray,
+    low_threshold: int = 24,
+    high_threshold: int = 231,
+) -> np.ndarray:
+    res = alpha_channel.copy()
+    masked = mask > 127
+    # Clamp small residual values inside the edited area back to 0 and pull
+    # near-opaque values back to 255 to avoid faint alpha ghosts after inpaint.
+    res[np.logical_and(masked, res <= low_threshold)] = 0
+    res[np.logical_and(masked, res >= high_threshold)] = 255
+    return res.astype(np.uint8)
+
+
+def inpaint_binary_like_alpha(alpha_channel: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    inpainted = cv2.inpaint(alpha_channel, mask, 3, cv2.INPAINT_TELEA)
+    masked = mask > 127
+    res = alpha_channel.copy()
+    # Binary-like alpha should stay binary after repair, otherwise tiny non-zero
+    # leftovers become visible when composited over a new background.
+    res[masked] = np.where(inpainted[masked] >= 127, 255, 0)
+    return res.astype(np.uint8)
+
+
 def adjust_mask(mask: np.ndarray, kernel_size: int, operate):
     # fronted brush color "ffcc00bb"
     # kernel_size = kernel_size*2+1

@@ -17,7 +17,16 @@ from rich.progress import (
     TaskProgressColumn,
 )
 
-from iopaint.helper import pil_to_bytes
+from iopaint.helper import (
+    pil_to_bytes,
+    alpha_channel_requires_inpaint,
+    alpha_channel_is_binary_like,
+    alpha_channel_to_rgb,
+    rgb_to_alpha_channel,
+    postprocess_alpha_channel,
+    inpaint_binary_like_alpha,
+    concat_alpha_channel,
+)
 from iopaint.model.utils import torch_gc
 from iopaint.model_manager import ModelManager
 from iopaint.schema import InpaintRequest
@@ -91,9 +100,15 @@ def batch_inpaint(
                 continue
             mask_p = mask_paths.get(stem, first_mask)
 
-            infos = Image.open(image_p).info
-
-            img = np.array(Image.open(image_p).convert("RGB"))
+            pil_img = Image.open(image_p)
+            infos = pil_img.info
+            alpha_channel = None
+            if pil_img.mode == "RGBA":
+                rgba_img = np.array(pil_img)
+                alpha_channel = rgba_img[:, :, -1]
+                img = cv2.cvtColor(rgba_img, cv2.COLOR_RGBA2RGB)
+            else:
+                img = np.array(pil_img.convert("RGB"))
             mask_img = np.array(Image.open(mask_p).convert("L"))
 
             if mask_img.shape[:2] != img.shape[:2]:
@@ -111,9 +126,22 @@ def batch_inpaint(
             # bgr
             inpaint_result = model_manager(img, mask_img, inpaint_request)
             inpaint_result = cv2.cvtColor(inpaint_result, cv2.COLOR_BGR2RGB)
+            if alpha_channel_requires_inpaint(alpha_channel):
+                if alpha_channel_is_binary_like(alpha_channel):
+                    # Match API behavior: binary-like alpha is repaired with
+                    # classical inpaint to avoid low-value transparency residue.
+                    alpha_channel = inpaint_binary_like_alpha(alpha_channel, mask_img)
+                else:
+                    alpha_rgb = alpha_channel_to_rgb(alpha_channel)
+                    alpha_bgr = model_manager(alpha_rgb, mask_img, inpaint_request)
+                    alpha_rgb_result = cv2.cvtColor(alpha_bgr, cv2.COLOR_BGR2RGB)
+                    alpha_channel = rgb_to_alpha_channel(alpha_rgb_result)
+                    alpha_channel = postprocess_alpha_channel(alpha_channel, mask_img)
             if concat:
                 mask_img = cv2.cvtColor(mask_img, cv2.COLOR_GRAY2RGB)
                 inpaint_result = cv2.hconcat([img, mask_img, inpaint_result])
+            else:
+                inpaint_result = concat_alpha_channel(inpaint_result, alpha_channel)
 
             img_bytes = pil_to_bytes(Image.fromarray(inpaint_result), "png", 100, infos)
             save_p = output / f"{stem}.png"

@@ -38,6 +38,12 @@ from iopaint.helper import (
     pil_to_bytes,
     numpy_to_bytes,
     concat_alpha_channel,
+    alpha_channel_requires_inpaint,
+    alpha_channel_is_binary_like,
+    alpha_channel_to_rgb,
+    rgb_to_alpha_channel,
+    postprocess_alpha_channel,
+    inpaint_binary_like_alpha,
     gen_frontend_mask,
     adjust_mask,
 )
@@ -282,6 +288,23 @@ class Api:
 
         start = time.time()
         rgb_np_img = self.model_manager(image, mask, req)
+        if alpha_channel_requires_inpaint(alpha_channel):
+            if alpha_channel_is_binary_like(alpha_channel):
+                # Transparent-background assets such as watermarks are more stable
+                # with deterministic alpha repair than with a second AI pass.
+                logger.info("Binary-like alpha detected, using classical alpha inpaint")
+                alpha_channel = inpaint_binary_like_alpha(alpha_channel, mask)
+            else:
+                # Real semi-transparent content still benefits from a separate pass
+                # so RGB and alpha are repaired independently before merging.
+                logger.info("Semi-transparent alpha detected, inpainting alpha channel")
+                alpha_rgb = alpha_channel_to_rgb(alpha_channel)
+                alpha_bgr = self.model_manager(alpha_rgb, mask, req)
+                alpha_rgb_np_img = cv2.cvtColor(
+                    alpha_bgr.astype(np.uint8), cv2.COLOR_BGR2RGB
+                )
+                alpha_channel = rgb_to_alpha_channel(alpha_rgb_np_img)
+                alpha_channel = postprocess_alpha_channel(alpha_channel, mask)
         logger.info(f"process time: {(time.time() - start) * 1000:.2f}ms")
         torch_gc()
 
